@@ -19,6 +19,8 @@ library(scales) # Versión 1.0.0
 library(data.table)
 library(tm)
 library(wordcloud)
+library(reticulate)
+library(quanteda)
 
 # Elegimos el directorio de trabajo donde se encuentran las bases de datos
 # (en este caso, el mismo donde se encuentra el presente script)
@@ -38,7 +40,7 @@ preproc.text <- function(x){
     tolower %>% # pasa a minúscula
     gsub("[^[:print:]]", " ", .) %>% # cambia caracteres no imprimibles por espacios
     gsub("[^[:lower:]^[:space:]]", " ", .) %>% # cambia puntuación y números por espacios
-    removeWords(., stopwords(kind = "sp")) %>% # elimina stopwords
+    removeWords(., c(stopwords(kind = "sp"), letters)) %>% # elimina stopwords
     gsub("[[:space:]]{1,}", " ", .) %>% # cambia espacios consecutivos por uno solo
     trimws # elimina espacios al inicio y al final de la cadena
   return(y)
@@ -68,6 +70,53 @@ contar_ngramas <- function(texto, n_palabras){
   df
 }
 
+# 2.4 y 2.5 Doc2Vec Python
+
+source_python("doc2vec.py")
+
+# 2.6 Hacer red de palabras ----
+hacer_red_palabras <- function(texto, terms_interes=c(), n_features=50){
+  
+  require(quanteda)
+  
+  # Crea el corpus del texto ingresado
+  corpus_texto <- quanteda::corpus(as.character(texto))
+  
+  # Crea la matriz términos y documentos (equivalente a un Bag of Words)
+  # dfmat <- dfm(corpus_texto, remove = stopwords('es'), remove_punct = TRUE)
+  dfmat <- dfm(corpus_texto)
+  
+  # Elimina los términos que no aparecen más de 1 vez
+  dfmat <- dfm_trim(dfmat, min_termfreq = 10)
+  
+  # Crea la matriz de coocurrencia de términos
+  fcmat <- fcm(dfmat)
+  
+  if (length(terms_interes) > 0){
+    
+    # Se quitan todas las concurrencias que no involucren los términos de interés
+    fcmat[!row.names(fcmat)%in%terms_interes, !colnames(fcmat)%in%terms_interes] <- 0
+    # Se vuelve a convertir el archivo a tpo "fcm"
+    fcmat <- as(fcmat,'fcm')
+    
+    # En este caso se dejan todas las concurrencias
+    feat <- names(topfeatures(fcmat, n_features))
+    fcmat_select <- fcm_select(fcmat, pattern = feat)
+    
+  } else {
+    # Identifica los n términos con mayor número de coocurrencias en el texto 
+    feat <- names(topfeatures(fcmat, n_features))
+    # Reduce la matriz de coocurrencias a los términos de interés
+    fcmat_select <- fcm_select(fcmat, pattern = feat)
+  }
+  
+  # Define el tamaño de los vértices (nodos) del gráfico, en función de su frecuencia
+  size <- log(colSums(dfm_select(dfmat, feat)))
+  
+  # Crea el gráfico de red a partir de la matriz de coocurrencias
+  set.seed(1)
+  textplot_network(fcmat_select, min_freq = 0.8, vertex_size = size / max(size) * 3)
+}
 
 # 3. LIMPIEZA DE DATOS ----
 
@@ -97,29 +146,52 @@ valores$`Valor Pendiente de Amortizacion` <- as.numeric(valores$`Valor Pendiente
 valores$`Valor Pendiente de Ejecucion` <- as.numeric(valores$`Valor Pendiente de Ejecucion`)
 valores$`Valor Pendiente de Pago` <- as.numeric(valores$`Valor Pendiente de Pago`)
 
-valores$`Descripción del Proceso` <- preproc.text(valores$`Descripción del Proceso`)
+valores$`texto_limpio` <- preproc.text(valores$`Descripción del Proceso`)
 
 # Extraemos año de inicio de los contratos
 valores$inicio <- as.numeric(substr(valores$`Fecha de Inicio del Contrato`, 7, 10))
 
 # Revisamos si el dataset contiene registros vacíos
 sum(is.na(valores))
-valores <- valores[complete.cases(valores),] # 340843 - 311643
+valores <- valores[complete.cases(valores),]
+sum(is.na(valores))
 
 # Revisamos si hay datos atípicos que puedan generar ruido en el análisis y los eliminamos
-ggplot(valores, aes(y = `Valor del Contrato`, col = `Tipo de Contrato`)) +
-  geom_boxplot()
+ggplot(valores, aes(y = `Valor del Contrato`/10^12, col = `Tipo de Contrato`)) +
+  geom_boxplot() +
+  xlab("Tipo de contrato") +
+  ylab("Valor del contrato (billones de pesos)")
 
-# Calculamos el percentil 95 y verificamos qué porcentaje de datos serán tomados como outliers
-valor_q_95 <- quantile(valores$`Valor del Contrato`,0.95)
-sum(valores$`Valor del Contrato`>=valor_q_95)/nrow(valores)
+# Calculamos el percentil 95 y verificamos qué porcentaje de datos serán tomados como outliers, 
+# para cada tipo de contrato
+tipos_de_contrato <- unique(valores$`Tipo de Contrato`)
+indices_atipicos <- NULL
 
-contratos_atipicos <- valores[valores$`Valor del Contrato`>=valor_q_95,]
-contratos_tipicos <- valores[valores$`Valor del Contrato`<valor_q_95,]
+for (i in 1:length(tipos_de_contrato)){
+  valor_q_95 <- quantile(valores$`Valor del Contrato`[valores$`Tipo de Contrato` == tipos_de_contrato[i]], 0.9)
+  
+  indices_atipicos <- c(indices_atipicos,
+                        which(valores$`Tipo de Contrato` == tipos_de_contrato[i] &
+                              valores$`Valor del Contrato`>=valor_q_95
+                              )
+                        )
+}
+
+contratos_tipicos <- valores[-indices_atipicos,]
+contratos_atipicos <- valores[indices_atipicos,]
 
 # Realizamos de nuevo el boxplot
-ggplot(contratos_tipicos, aes(y = `Valor del Contrato`, col = `Tipo de Contrato`)) +
-  geom_boxplot()
+ggplot(contratos_tipicos, aes(y = `Valor del Contrato`/10^9, col = `Tipo de Contrato`)) +
+  geom_boxplot() +
+  xlab("Tipo de contrato") +
+  ylab("Valor del contrato (miles de millones)")
+
+# Realizamos uno más, excluyendo concesiones
+ggplot(contratos_tipicos[contratos_tipicos$`Tipo de Contrato` != "Concesión"], aes(y = `Valor del Contrato`/10^9, col = `Tipo de Contrato`)) +
+  geom_boxplot() +
+  xlab("Tipo de contrato") +
+  ylab("Valor del contrato (miles de millones)")
+
 
 # 3. ANÁLISIS DESCRIPTIVO Y EXPLORATORIO ----
 
@@ -154,9 +226,9 @@ sum(contratos_tipicos$`Tipo de Contrato` == "Prestación de servicios")/nrow(con
 ggplot(contratos_tipicos, aes(x = `Valor Pagado`, y = `Valor Pendiente de Pago`)) +
   geom_point(col = "dodgerblue2")
 
-# Nube de palabras - contratos altos
+# Nube de palabras - contratos normales
 
-mi_df <- contar_ngramas(contratos_atipicos$`Descripción del Proceso`, 1)
+mi_df <- contar_ngramas(contratos_tipicos$`texto_limpio`, 2)
 
 set.seed(1234)
 X11()
@@ -167,11 +239,11 @@ wordcloud(words = mi_df$Palabra, freq = mi_df$Frecuencia, min.freq = 1,
 # Nube de palabras - contratos normales
 
 nuevas_stopwords <- c("prestación", "prestar", "servicio", "servicios", "contrat\\w+")
-contratos_tipicos$`Descripción del Proceso` <- removeWords(contratos_tipicos$`Descripción del Proceso`, nuevas_stopwords)
-contratos_tipicos$`Descripción del Proceso` <- gsub("[[:space:]]{1,}", " ", contratos_tipicos$`Descripción del Proceso`) 
-contratos_tipicos$`Descripción del Proceso` <- trimws(contratos_tipicos$`Descripción del Proceso`)
+contratos_tipicos$`texto_limpio` <- removeWords(contratos_tipicos$`texto_limpio`, nuevas_stopwords)
+contratos_tipicos$`texto_limpio` <- gsub("[[:space:]]{1,}", " ", contratos_tipicos$`texto_limpio`) 
+contratos_tipicos$`texto_limpio` <- trimws(contratos_tipicos$`texto_limpio`)
 
-mi_df <- contar_ngramas(contratos_tipicos$`Descripción del Proceso`, 1)
+mi_df <- contar_ngramas(contratos_tipicos$`texto_limpio`, 2)
 
 set.seed(123)
 X11()
@@ -179,7 +251,9 @@ wordcloud(words = mi_df$Palabra, freq = mi_df$Frecuencia, min.freq = 1,
           max.words=200, random.order=FALSE, rot.per=0.15, 
           colors=brewer.pal(8, "Dark2"))
 
-                                                rm(mi_df, contratos, valores)
+
+
+rm(mi_df, contratos, valores)
 
 contratos_para_analisis <- contratos_tipicos %>%
   filter(inicio == 2019, `Tipo de Contrato` == "Prestación de servicios",
