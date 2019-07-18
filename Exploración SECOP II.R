@@ -178,3 +178,102 @@ X11()
 wordcloud(words = mi_df$Palabra, freq = mi_df$Frecuencia, min.freq = 1,
           max.words=200, random.order=FALSE, rot.per=0.15, 
           colors=brewer.pal(8, "Dark2"))
+
+                                                rm(mi_df, contratos, valores)
+
+contratos_para_analisis <- contratos_tipicos %>%
+  filter(inicio == 2019, `Tipo de Contrato` == "Prestación de servicios",
+         `Tipo Documento Proveedor` == "NIT")
+
+bag_of_words <- dfm(contratos_para_analisis$texto_limpio)
+indices_ceros <- which(rowSums(bag_of_words) == 0)
+
+sum(contratos_para_analisis$`Valor del Contrato`[indices_ceros])
+
+dfm_para_pca <- dfm_trim(bag_of_words, min_termfreq = 50)
+
+mi_pca_bow <- prcomp(dfm_para_pca)
+
+which(summary(mi_pca_bow)$importance[3,] > 0.90)[1]
+plot(summary(mi_pca_bow)$importance[3,], xlab = "Number of Principal Components",
+     ylab = "% of variance explained")
+
+contratos_para_analisis <- contratos_para_analisis[-indices_ceros,]
+bag_of_words <- bag_of_words[-indices_ceros,]
+
+
+
+# 4. Vectorización y agrupación de textos
+
+modelo_doc2vec <- doc2vec_model(contratos_para_analisis$texto_limpio, long_vector = 50, freq_min = 20, ventana = 10)
+textos_vectorizados <- doc2vec_predict(modelo_doc2vec, contratos_para_analisis$texto_limpio)
+
+clusters_contratos <- list()
+
+for (i in 1:15){
+  set.seed(1123)
+  clusters_contratos[[i]] <- kmeans(textos_vectorizados, centers = i)
+  print(i)
+}
+
+total_wss <- sapply(clusters_contratos, function(x) return(x$tot.withinss))
+
+plot(total_wss, xlab = "Number of clusters", ylab = "Total within sum of squares")
+
+n_clusters <- 5
+
+clustering_elegido <- factor(clusters_contratos[[n_clusters]]$cluster)
+
+pca_contratos <- prcomp(textos_vectorizados)
+
+cluster <- clustering_elegido
+
+ggplot(data.frame(pca_contratos$x[,1:2]), aes(x = PC1, y = PC2, col = cluster)) +
+  geom_point()
+
+ggplot(data.frame(pca_contratos$x[,2:3]), aes(x = PC2, y = PC3, col = cluster)) +
+  geom_point()
+
+distancias <- matrix(NA, nrow = nrow(textos_vectorizados), ncol = n_clusters)
+
+for(i in 1:nrow(textos_vectorizados)){
+  for(j in 1:n_clusters){
+    distancias[i,j] <- dist(rbind(textos_vectorizados[i,],
+                                  clusters_contratos[[n_clusters]]$centers[j,]))
+  }
+}
+
+contratos_cluster <- vector("list", n_clusters)
+for (i in 1: n_clusters){
+  distancias_menores <- head(order(distancias[clusters_contratos[[n_clusters]]$cluster == i, i]), 50)
+  contratos_cluster[[i]] <- contratos_para_analisis[clusters_contratos[[n_clusters]]$cluster == i,][distancias_menores,]
+}
+
+View(contratos_cluster[[1]])
+
+
+keywords_contratos <- vector(mode = "list", length = n_clusters)
+
+for (i in 1:(n_clusters)){
+  dfm_interes <- quanteda::dfm(contratos_para_analisis$texto_limpio[clustering_elegido == i])
+  dfm_interes <- dfm_trim(dfm_interes, min_termfreq = 10)
+  
+  dfm_referencia <- quanteda::dfm(contratos_para_analisis$texto_limpio[clustering_elegido != i])
+  dfm_referencia <- dfm_trim(dfm_referencia, min_termfreq = 10)
+  
+  keywords_contratos[[i]] <- textstat_keyness(rbind(dfm_interes, dfm_referencia), seq_len(ndoc(dfm_interes)))
+}
+
+tabla_keywords <- t(sapply(keywords_contratos, function(x) return(head(x$feature, 10))))
+
+hist(contratos_para_analisis$`Valor del Contrato`[clustering_elegido == 1] / 10^6,
+     main = "Distribution of the value of\ncontracts for cluster 1",
+     xlab = "Value of the contract (millions of pesos)",
+     ylab = "Frequency",
+     col = "dodgerblue2")
+
+hacer_red_palabras(contratos_para_analisis$texto_limpio[clustering_elegido == 1], n_features = 40)
+hacer_red_palabras(contratos_para_analisis$texto_limpio[clustering_elegido == 2], n_features = 40)
+hacer_red_palabras(contratos_para_analisis$texto_limpio[clustering_elegido == 3], n_features = 40)
+hacer_red_palabras(contratos_para_analisis$texto_limpio[clustering_elegido == 4], n_features = 40)
+hacer_red_palabras(contratos_para_analisis$texto_limpio[clustering_elegido == 5], n_features = 40)
